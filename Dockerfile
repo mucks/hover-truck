@@ -33,6 +33,9 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Install wasm32 target and build tools
+RUN rustup target add wasm32-unknown-unknown
+
 # Install Trunk and wasm-bindgen-cli separately to reduce memory pressure
 # Use --locked and limit parallelism to reduce memory usage
 ENV CARGO_BUILD_JOBS=1
