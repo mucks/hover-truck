@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-authors = ["Hover Train"]
+authors = ["Hover Truck"]
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

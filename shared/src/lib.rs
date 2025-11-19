@@ -24,8 +24,9 @@ pub struct PlayerState {
 	pub id: PlayerId,
 	pub position: Vec3,
 	pub rotation_y: f32, // yaw angle in radians
-	pub train: VecDeque<Vec3>,
+	pub trailer: VecDeque<Vec3>,
 	pub alive: bool,
+	pub boost_meter: f32, // Boost meter from 0.0 to 1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +46,7 @@ pub struct WorldState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientToServer {
 	Hello { name: String },
-	Input { turn: TurnInput },
+	Input { turn: TurnInput, boost: bool },
 	Ping(u64),
 }
 
@@ -70,7 +71,7 @@ impl Default for GameConfig {
 	fn default() -> Self {
 		Self {
 			world_size: 128.0, // Doubled from 64.0 (full world is now 256x256)
-			player_speed: 6.0,
+			player_speed: 12.0, // Doubled from 6.0
 			turn_speed: 2.5,
 			initial_length: 3,
 			item_spawn_every_ticks: 20,
@@ -82,6 +83,7 @@ pub struct GameSim {
 	pub cfg: GameConfig,
 	pub state: WorldState,
 	pub pending_inputs: HashMap<PlayerId, TurnInput>,
+	pub pending_boosts: HashMap<PlayerId, bool>,
 }
 
 impl GameSim {
@@ -94,6 +96,7 @@ impl GameSim {
 				tick: 0,
 			},
 			pending_inputs: HashMap::new(),
+			pending_boosts: HashMap::new(),
 			cfg,
 		}
 	}
@@ -102,19 +105,22 @@ impl GameSim {
 		let id = Uuid::new_v4();
 		let mut rng = rand::thread_rng();
 		let ws = self.cfg.world_size;
+		// Keep players away from edges (15 unit buffer to account for trailer length)
+		let margin = 15.0;
+		let spawn_range = (ws - margin).max(5.0); // Ensure at least 5 units of spawn range
 		let position = Vec3 {
-			x: rng.gen_range(-ws..ws),
+			x: rng.gen_range(-spawn_range..spawn_range),
 			y: 0.5,
-			z: rng.gen_range(-ws..ws),
+			z: rng.gen_range(-spawn_range..spawn_range),
 		};
 		let rotation_y = rng.gen_range(0.0..std::f32::consts::TAU);
 		
-		// Initialize train with 2 carts (3 positions total: player + 2 carts)
+		// Initialize trailer with 2 carts (3 positions total: player + 2 carts)
 		// Calculate positions behind the player for the carts
 		// Cart spacing: cart length (1.4) + gap (0.8) = 2.2 units between cart centers
 		// Player back to first cart: player_back_offset (0.9) + gap (0.8) + cart_front_offset (0.7) = 2.4 units
-		let mut train = VecDeque::new();
-		train.push_back(position); // Current position (player)
+		let mut trailer = VecDeque::new();
+		trailer.push_back(position); // Current position (player)
 		
 		// Calculate backward direction from rotation
 		let backward_x = -rotation_y.sin();
@@ -126,7 +132,7 @@ impl GameSim {
 			y: 0.5,
 			z: position.z + backward_z * 2.4,
 		};
-		train.push_back(cart1_pos);
+		trailer.push_back(cart1_pos);
 		
 		// Second cart position: behind first cart by 2.2 units (cart back + gap + cart front)
 		let cart2_pos = Vec3 {
@@ -134,9 +140,16 @@ impl GameSim {
 			y: 0.5,
 			z: cart1_pos.z + backward_z * 2.2,
 		};
-		train.push_back(cart2_pos);
+		trailer.push_back(cart2_pos);
 		
-		self.state.players.insert(id, PlayerState { id, position, rotation_y, train, alive: true });
+		self.state.players.insert(id, PlayerState { 
+			id, 
+			position, 
+			rotation_y, 
+			trailer, 
+			alive: true,
+			boost_meter: 1.0, // Start with full boost
+		});
 		id
 	}
 
@@ -149,24 +162,34 @@ impl GameSim {
 		if let Some(player) = self.state.players.get_mut(id) {
 			let mut rng = rand::thread_rng();
 			let ws = self.cfg.world_size;
+			// Keep players away from edges (15 unit buffer to account for trailer length)
+			let margin = 15.0;
+			let spawn_range = (ws - margin).max(5.0); // Ensure at least 5 units of spawn range
 			// Respawn at random position
 			player.position = Vec3 {
-				x: rng.gen_range(-ws..ws),
+				x: rng.gen_range(-spawn_range..spawn_range),
 				y: 0.5,
-				z: rng.gen_range(-ws..ws),
+				z: rng.gen_range(-spawn_range..spawn_range),
 			};
 			player.rotation_y = rng.gen_range(0.0..std::f32::consts::TAU);
-			// Reset train to just the player position (no cubes)
-			player.train.clear();
-			player.train.push_back(player.position);
+			// Reset trailer to just the player position (no cubes)
+			player.trailer.clear();
+			player.trailer.push_back(player.position);
 			player.alive = true;
+			// Reset boost state
+			player.boost_meter = 1.0; // Reset to full boost
 			// Clear any pending inputs
 			self.pending_inputs.remove(id);
+			self.pending_boosts.remove(id);
 		}
 	}
 
 	pub fn submit_input(&mut self, id: PlayerId, input: TurnInput) {
 		self.pending_inputs.insert(id, input);
+	}
+
+	pub fn submit_boost(&mut self, id: PlayerId, boost: bool) {
+		self.pending_boosts.insert(id, boost);
 	}
 
 	fn wrap(&self, pos: Vec3) -> Vec3 {
@@ -194,12 +217,32 @@ impl GameSim {
 
 	pub fn step(&mut self) {
 		self.state.tick += 1;
-		let dt = 0.1; // 100ms tick = 0.1 seconds
+		let dt = 1.0 / 30.0; // 33ms tick ≈ 0.033 seconds (30 TPS)
 		let world_size = self.cfg.world_size;
 		
 		// Apply inputs and move players
 		for player in self.state.players.values_mut() {
 			if !player.alive { continue; }
+			
+			// Handle boost input and update boost meter
+			let boost_pressed = self.pending_boosts.remove(&player.id).unwrap_or(false);
+			let boost_active = boost_pressed && player.boost_meter > 0.0;
+			
+			if boost_active {
+				// Deplete boost meter while boosting (depletes in 2 seconds at full speed)
+				let deplete_rate = 1.0 / 2.0; // Deplete full meter in 2 seconds
+				player.boost_meter -= deplete_rate * dt;
+				if player.boost_meter < 0.0 {
+					player.boost_meter = 0.0;
+				}
+			} else {
+				// Regenerate boost meter slowly when not boosting (regenerates in 5 seconds)
+				let regen_rate = 1.0 / 5.0; // Regenerate full meter in 5 seconds
+				player.boost_meter += regen_rate * dt;
+				if player.boost_meter > 1.0 {
+					player.boost_meter = 1.0;
+				}
+			}
 			
 			// Apply turn input
 			if let Some(input) = self.pending_inputs.remove(&player.id) {
@@ -211,14 +254,16 @@ impl GameSim {
 				}
 			}
 			
-			// Auto-forward movement
+			// Auto-forward movement with boost multiplier
+			let boost_active = boost_pressed && player.boost_meter > 0.0;
+			let speed_multiplier = if boost_active { 2.0 } else { 1.0 };
 			let forward_x = player.rotation_y.sin();
 			let forward_z = player.rotation_y.cos();
-			player.position.x += forward_x * self.cfg.player_speed * dt;
-			player.position.z += forward_z * self.cfg.player_speed * dt;
+			player.position.x += forward_x * self.cfg.player_speed * speed_multiplier * dt;
+			player.position.z += forward_z * self.cfg.player_speed * speed_multiplier * dt;
 			
 			// Check wall collisions - kill player if they hit the boundary
-			// Player radius is approximately 0.5 (half of 1.0 cube size, but we use 0.9 for train shape)
+			// Player radius is approximately 0.5 (half of 1.0 cube size, but we use 0.9 for truck shape)
 			let player_radius = 0.5;
 			if player.position.x <= -world_size + player_radius || 
 			   player.position.x >= world_size - player_radius ||
@@ -233,7 +278,7 @@ impl GameSim {
 			player.position.y = 0.5; // Maintain hover height
 		}
 		
-		// Check items and update trains
+		// Check items and update trailers
 		let mut items_to_remove = Vec::new();
 		let mut player_grew: HashMap<PlayerId, bool> = HashMap::new();
 		
@@ -253,8 +298,162 @@ impl GameSim {
 				}
 			}
 			
-			// Update train
-			player.train.push_front(player.position);
+			// Determine target trailer length
+			// If player grew, add one cart. If didn't grow, remove one cart (but keep at least initial_length)
+			let current_length = player.trailer.len();
+			let min_length = self.cfg.initial_length; // Minimum trailer length (player + initial carts)
+			let target_length = if consumed {
+				current_length + 1 // Add a cart when growing
+			} else {
+				(current_length as i32 - 1).max(min_length as i32) as usize // Remove a cart when not growing, but keep at least min_length
+			};
+			
+			// Update trailer - store actual cart positions, not just historical player positions
+			// Calculate current cart positions based on physics
+			let gap = 0.8;
+			let player_back_offset = 0.9;
+			let cart_front_offset = 0.7;
+			let cart_back_offset = 0.7;
+			let hitch_length = gap + cart_front_offset;
+			
+			let player_forward = Vec3 {
+				x: player.rotation_y.sin(),
+				y: 0.0,
+				z: player.rotation_y.cos(),
+			};
+			
+			// Calculate new cart positions based on current player state
+			let mut new_trailer = VecDeque::new();
+			new_trailer.push_back(player.position); // First element is always player position
+			
+			// Calculate positions for existing carts (target_length - 1 because we already added player position)
+			let num_carts = target_length - 1;
+			if num_carts > 0 {
+				// Get previous cart positions for direction calculation
+				let mut prev_cart_pos: Option<Vec3> = None;
+				let mut prev_cart_forward: Option<Vec3> = None;
+				
+				// Use previous trailer positions to get direction, but recalculate actual positions
+				let mut old_trailer_iter = player.trailer.iter().skip(1);
+				
+				for order in 0..num_carts {
+					let old_pos = old_trailer_iter.next();
+					
+					let (cart_pos, cart_forward) = if order == 0 {
+						// First cart: attached to player
+						let hitch_point = Vec3 {
+							x: player.position.x - player_forward.x * player_back_offset,
+							y: 0.5,
+							z: player.position.z - player_forward.z * player_back_offset,
+						};
+						
+						// Use old position to determine direction if available
+						if let Some(&old_cart_pos) = old_pos {
+							let to_hitch = Vec3 {
+								x: hitch_point.x - old_cart_pos.x,
+								y: 0.0,
+								z: hitch_point.z - old_cart_pos.z,
+							};
+							let to_hitch_dist = (to_hitch.x * to_hitch.x + to_hitch.z * to_hitch.z).sqrt();
+							
+							if to_hitch_dist > 0.001 {
+								let to_hitch_dir = Vec3 {
+									x: to_hitch.x / to_hitch_dist,
+									y: 0.0,
+									z: to_hitch.z / to_hitch_dist,
+								};
+								let cart_pos = Vec3 {
+									x: hitch_point.x - to_hitch_dir.x * hitch_length,
+									y: 0.5,
+									z: hitch_point.z - to_hitch_dir.z * hitch_length,
+								};
+								(cart_pos, to_hitch_dir)
+							} else {
+								let backward = Vec3 { x: -player_forward.x, y: 0.0, z: -player_forward.z };
+								let cart_pos = Vec3 {
+									x: hitch_point.x + backward.x * hitch_length,
+									y: 0.5,
+									z: hitch_point.z + backward.z * hitch_length,
+								};
+								(cart_pos, player_forward)
+							}
+						} else {
+							let backward = Vec3 { x: -player_forward.x, y: 0.0, z: -player_forward.z };
+							let cart_pos = Vec3 {
+								x: hitch_point.x + backward.x * hitch_length,
+								y: 0.5,
+								z: hitch_point.z + backward.z * hitch_length,
+							};
+							(cart_pos, player_forward)
+						}
+					} else {
+						// Subsequent carts
+						if let (Some(prev_pos), Some(prev_fwd)) = (prev_cart_pos, prev_cart_forward) {
+							let hitch_point = Vec3 {
+								x: prev_pos.x - prev_fwd.x * cart_back_offset,
+								y: 0.5,
+								z: prev_pos.z - prev_fwd.z * cart_back_offset,
+							};
+							
+							if let Some(&old_cart_pos) = old_pos {
+								let to_hitch = Vec3 {
+									x: hitch_point.x - old_cart_pos.x,
+									y: 0.0,
+									z: hitch_point.z - old_cart_pos.z,
+								};
+								let to_hitch_dist = (to_hitch.x * to_hitch.x + to_hitch.z * to_hitch.z).sqrt();
+								
+								if to_hitch_dist > 0.001 {
+									let to_hitch_dir = Vec3 {
+										x: to_hitch.x / to_hitch_dist,
+										y: 0.0,
+										z: to_hitch.z / to_hitch_dist,
+									};
+									let cart_pos = Vec3 {
+										x: hitch_point.x - to_hitch_dir.x * hitch_length,
+										y: 0.5,
+										z: hitch_point.z - to_hitch_dir.z * hitch_length,
+									};
+									(cart_pos, to_hitch_dir)
+								} else {
+									let backward = Vec3 { x: -prev_fwd.x, y: 0.0, z: -prev_fwd.z };
+									let cart_pos = Vec3 {
+										x: hitch_point.x + backward.x * hitch_length,
+										y: 0.5,
+										z: hitch_point.z + backward.z * hitch_length,
+									};
+									(cart_pos, prev_fwd)
+								}
+							} else {
+								let backward = Vec3 { x: -prev_fwd.x, y: 0.0, z: -prev_fwd.z };
+								let cart_pos = Vec3 {
+									x: hitch_point.x + backward.x * hitch_length,
+									y: 0.5,
+									z: hitch_point.z + backward.z * hitch_length,
+								};
+								(cart_pos, prev_fwd)
+							}
+						} else {
+							// Fallback
+							let backward = Vec3 { x: -player_forward.x, y: 0.0, z: -player_forward.z };
+							let cart_pos = Vec3 {
+								x: player.position.x + backward.x * hitch_length * (order as f32 + 1.0),
+								y: 0.5,
+								z: player.position.z + backward.z * hitch_length * (order as f32 + 1.0),
+							};
+							(cart_pos, player_forward)
+						}
+					};
+					
+					new_trailer.push_back(cart_pos);
+					prev_cart_pos = Some(cart_pos);
+					prev_cart_forward = Some(cart_forward);
+				}
+			}
+			
+			// Update trailer with new positions
+			player.trailer = new_trailer;
+			
 			player_grew.insert(player.id, consumed);
 		}
 		
@@ -263,31 +462,42 @@ impl GameSim {
 			self.state.items.remove(&iid);
 		}
 		
-		// Pop train tails for players that didn't grow
-		for player in self.state.players.values_mut() {
-			if !player.alive { continue; }
-			if !player_grew.get(&player.id).copied().unwrap_or(false) && player.train.len() > 1 {
-				player.train.pop_back();
-			}
-		}
-		
-		// Check collisions between players (need to clone train data to avoid borrow conflicts)
+		// Check collisions between players and trailers
+		// The trailer VecDeque now stores actual cart positions (calculated above)
+		// Players die if they collide with another player OR another player's trailer segments
 		let player_data: Vec<(PlayerId, Vec3, VecDeque<Vec3>)> = self.state.players.iter()
 			.filter(|(_, p)| p.alive)
-			.map(|(id, p)| (*id, p.position, p.train.clone()))
+			.map(|(id, p)| (*id, p.position, p.trailer.clone()))
 			.collect();
 		
 		let mut players_to_kill = Vec::new();
 		for (player_id, player_pos, _) in &player_data {
-			for (other_id, _, other_train) in &player_data {
+			for (other_id, other_pos, other_trailer) in &player_data {
 				if *player_id == *other_id { continue; }
-				for &train_pos in other_train {
-					let dx = player_pos.x - train_pos.x;
-					let dz = player_pos.z - train_pos.z;
+				
+				// Check collision with other player directly (player-to-player collision)
+				let dx = player_pos.x - other_pos.x;
+				let dz = player_pos.z - other_pos.z;
+				let dist_sq = dx * dx + dz * dz;
+				let player_collision_dist = 0.5 + 0.5; // Both players have radius 0.5
+				if dist_sq <= player_collision_dist * player_collision_dist {
+					players_to_kill.push(*player_id);
+					continue;
+				}
+				
+				// Check collision with other player's trailer cart positions
+				// Skip the first element (index 0) as that's the player's own position
+				for (order, &cart_pos) in other_trailer.iter().enumerate() {
+					if order == 0 { continue; } // Skip player's own position
+					
+					let dx = player_pos.x - cart_pos.x;
+					let dz = player_pos.z - cart_pos.z;
 					let dist_sq = dx * dx + dz * dz;
-					if dist_sq <= 0.5 * 0.5 {
+					// Player radius (0.5) + trailer cart radius (0.35, cart is 0.7 wide)
+					let trailer_collision_dist = 0.5 + 0.35;
+					if dist_sq <= trailer_collision_dist * trailer_collision_dist {
 						players_to_kill.push(*player_id);
-						break;
+						break; // Only need to detect one collision per other player
 					}
 				}
 				if players_to_kill.contains(player_id) { break; }

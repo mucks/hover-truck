@@ -32,10 +32,10 @@ async fn main() -> anyhow::Result<()> {
 		.route("/ws", get(ws_handler))
 		.with_state(state.clone());
 
-	// Tick loop
+	// Tick loop - 30 TPS to reduce stuttering with higher speeds
 	let state_for_tick = state.clone();
 	tokio::spawn(async move {
-		let mut ticker = tokio::time::interval(Duration::from_millis(100));
+		let mut ticker = tokio::time::interval(Duration::from_millis(33));
 		loop {
 			ticker.tick().await;
 			let mut sim = state_for_tick.sim.lock().await;
@@ -106,9 +106,10 @@ async fn client_connection(mut socket: WebSocket, state: AppState) {
 		match msg {
 			Message::Text(txt) => {
 				match serde_json::from_str::<ClientToServer>(&txt) {
-					Ok(ClientToServer::Input { turn }) => {
+					Ok(ClientToServer::Input { turn, boost }) => {
 						let mut sim = state.sim.lock().await;
 						sim.submit_input(player_id, turn);
+						sim.submit_boost(player_id, boost);
 					}
 					Ok(ClientToServer::Ping(n)) => {
 						let _ = tx_direct.send(Message::Text(serde_json::to_string(&ServerToClient::Pong(n)).unwrap())).await;
