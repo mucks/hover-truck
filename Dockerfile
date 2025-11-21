@@ -25,14 +25,15 @@ RUN mkdir -p shared/src server/src client/src && \
 
 # Build dependencies (this layer will be cached if Cargo files don't change)
 ENV CARGO_BUILD_JOBS=2
-RUN cargo build --release -p server && \
-    rm -rf server/src client/src shared/src
+RUN cargo build --release -p server
 
-# Now copy actual source code
+# Now copy actual source code (overwrites dummy files)
 COPY shared ./shared
 COPY server ./server
+# Also copy client to satisfy workspace (even though we don't build it in this stage)
+COPY client ./client
 
-# Build server (only rebuilds if source changed)
+# Rebuild server with actual source (only rebuilds if source changed)
 RUN cargo build --release -p server
 
 # Stage 2: Build WASM client
@@ -68,15 +69,14 @@ RUN mkdir -p shared/src client/src server/src && \
     echo "pub fn dummy() {}" > shared/src/lib.rs
 
 # Build dependencies (this layer will be cached if Cargo files don't change)
-RUN cargo build --release --target wasm32-unknown-unknown -p client && \
-    rm -rf client/src server/src shared/src
+RUN cargo build --release --target wasm32-unknown-unknown -p client
 
-# Now copy actual source code
+# Now copy actual source code (overwrites dummy files)
 COPY shared ./shared
 COPY client ./client
 COPY server ./server
 
-# Build client WASM (only rebuilds if source changed)
+# Rebuild client with actual source (only rebuilds if source changed)
 WORKDIR /app/client
 RUN trunk build --release
 
