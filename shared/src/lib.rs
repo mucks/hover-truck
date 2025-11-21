@@ -41,6 +41,7 @@ pub struct WorldState {
 	pub players: HashMap<PlayerId, PlayerState>,
 	pub items: HashMap<Uuid, Item>,
 	pub tick: u64,
+	pub bots: std::collections::HashSet<PlayerId>, // Track which players are bots (synchronized to clients)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +85,7 @@ pub struct GameSim {
 	pub state: WorldState,
 	pub pending_inputs: HashMap<PlayerId, TurnInput>,
 	pub pending_boosts: HashMap<PlayerId, bool>,
+	pub bots: std::collections::HashSet<PlayerId>, // Track which players are bots
 }
 
 impl GameSim {
@@ -94,9 +96,11 @@ impl GameSim {
 				players: HashMap::new(),
 				items: HashMap::new(),
 				tick: 0,
+				bots: std::collections::HashSet::new(),
 			},
 			pending_inputs: HashMap::new(),
 			pending_boosts: HashMap::new(),
+			bots: std::collections::HashSet::new(),
 			cfg,
 		}
 	}
@@ -156,6 +160,15 @@ impl GameSim {
 	pub fn remove_player(&mut self, id: &PlayerId) {
 		self.state.players.remove(id);
 		self.pending_inputs.remove(id);
+		self.pending_boosts.remove(id);
+		self.bots.remove(id);
+	}
+
+	// Add a bot player
+	pub fn add_bot(&mut self) -> PlayerId {
+		let id = self.add_player();
+		self.bots.insert(id);
+		id
 	}
 
 	pub fn respawn_player(&mut self, id: &PlayerId) {
@@ -276,6 +289,79 @@ impl GameSim {
 				player.position.z = player.position.z.clamp(-world_size + player_radius, world_size - player_radius);
 			}
 			player.position.y = 0.5; // Maintain hover height
+		}
+		
+		// Bot AI: make bots move towards nearest items
+		for (bot_id, player) in self.state.players.iter_mut() {
+			if !self.bots.contains(bot_id) || !player.alive {
+				continue;
+			}
+			
+			// Find nearest item
+			let mut nearest_item: Option<(Uuid, Vec3, f32)> = None;
+			for (item_id, item) in &self.state.items {
+				let dx = item.pos.x - player.position.x;
+				let dz = item.pos.z - player.position.z;
+				let dist_sq = dx * dx + dz * dz;
+				if let Some((_, _, nearest_dist_sq)) = nearest_item {
+					if dist_sq < nearest_dist_sq {
+						nearest_item = Some((*item_id, item.pos, dist_sq));
+					}
+				} else {
+					nearest_item = Some((*item_id, item.pos, dist_sq));
+				}
+			}
+			
+			if let Some((_item_id, target_pos, dist_sq)) = nearest_item {
+				// Calculate desired direction to item
+				let dx = target_pos.x - player.position.x;
+				let dz = target_pos.z - player.position.z;
+				let dist = dist_sq.sqrt();
+				
+				if dist > 0.1 {
+					let target_dir = Vec3 { x: dx / dist, y: 0.0, z: dz / dist };
+					
+					// Calculate current forward direction
+					let forward_x = player.rotation_y.sin();
+					let forward_z = player.rotation_y.cos();
+					let current_forward = Vec3 { x: forward_x, y: 0.0, z: forward_z };
+					
+					// Calculate angle difference (using cross product to determine left/right)
+					let cross = current_forward.x * target_dir.z - current_forward.z * target_dir.x;
+					
+					// Determine turn direction
+					let turn_threshold = 0.1; // Turn if more than this angle off
+					if cross.abs() > turn_threshold {
+						if cross > 0.0 {
+							// Turn left
+							self.pending_inputs.insert(*bot_id, TurnInput::Left);
+						} else {
+							// Turn right
+							self.pending_inputs.insert(*bot_id, TurnInput::Right);
+						}
+					} else {
+						// Go straight if aligned
+						self.pending_inputs.insert(*bot_id, TurnInput::Straight);
+					}
+					
+					// Use boost if item is far and boost is available
+					if dist > 15.0 && player.boost_meter > 0.3 {
+						self.pending_boosts.insert(*bot_id, true);
+					}
+				}
+			} else {
+				// No items, wander randomly
+				let mut rng = rand::thread_rng();
+				if rng.gen_bool(0.1) { // 10% chance to turn each tick
+					if rng.gen_bool(0.5) {
+						self.pending_inputs.insert(*bot_id, TurnInput::Left);
+					} else {
+						self.pending_inputs.insert(*bot_id, TurnInput::Right);
+					}
+				} else {
+					self.pending_inputs.insert(*bot_id, TurnInput::Straight);
+				}
+			}
 		}
 		
 		// Check items and update trailers
@@ -524,6 +610,10 @@ impl GameSim {
 			// Check if player has been dead long enough (simple: respawn immediately for now)
 			// In a real game you might want a respawn timer
 			self.respawn_player(&player_id);
+			// If it was a bot, ensure it stays marked as a bot after respawn
+			if self.bots.contains(&player_id) {
+				// Bot remains a bot after respawn (already in the set)
+			}
 		}
 		
 		// Periodic spawn

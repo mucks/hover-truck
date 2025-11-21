@@ -1649,10 +1649,13 @@ fn sync_world_state(
         }
 
         // Determine base color
+        let is_bot = world.bots.contains(player_id);
         let base_color = if is_me {
             Color::srgb(0.2, 0.8, 0.95) // Blue for main player
         } else if is_test {
             Color::srgb(0.4, 0.95, 0.3) // Green for test player
+        } else if is_bot {
+            Color::srgb(0.7, 0.3, 0.9) // Purple for bots
         } else {
             Color::srgb(0.95, 0.4, 0.3) // Red for other players
         };

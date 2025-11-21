@@ -24,7 +24,11 @@ struct AppState {
 async fn main() -> anyhow::Result<()> {
 	tracing_subscriber::fmt().with_env_filter("info").init();
 
-	let sim = GameSim::new(GameConfig::default());
+	let mut sim = GameSim::new(GameConfig::default());
+	// Spawn some bots at startup
+	for _ in 0..3 {
+		sim.add_bot();
+	}
 	let (tx_state, _rx_state) = broadcast::channel::<String>(64);
 	let state = AppState { sim: Arc::new(Mutex::new(sim)), tx_state };
 
@@ -40,7 +44,10 @@ async fn main() -> anyhow::Result<()> {
 			ticker.tick().await;
 			let mut sim = state_for_tick.sim.lock().await;
 			sim.step();
-			let world = serde_json::to_string(&ServerToClient::State(sim.state.clone()));
+			// Sync bot info to world state before sending to clients
+			let mut world_state = sim.state.clone();
+			world_state.bots = sim.bots.clone();
+			let world = serde_json::to_string(&ServerToClient::State(world_state));
 			if let Ok(json) = world {
 				let _ = state_for_tick.tx_state.send(json);
 			}
@@ -132,5 +139,10 @@ async fn client_connection(mut socket: WebSocket, state: AppState) {
 	let _ = writer_handle.await;
 	let mut sim = state.sim.lock().await;
 	sim.remove_player(&player_id);
+	
+	// Spawn a new bot when a player disconnects (to maintain some bots)
+	if sim.bots.len() < 3 {
+		sim.add_bot();
+	}
 }
 

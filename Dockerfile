@@ -11,14 +11,28 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy workspace files (need all members for workspace to be valid)
+# Copy only Cargo files first for better caching
 COPY Cargo.toml Cargo.lock ./
+COPY shared/Cargo.toml ./shared/
+COPY server/Cargo.toml ./server/
+COPY client/Cargo.toml ./client/
+
+# Create dummy source files to build dependencies only
+RUN mkdir -p shared/src server/src client/src && \
+    echo "fn main() {}" > server/src/main.rs && \
+    echo "fn main() {}" > client/src/main.rs && \
+    echo "pub fn dummy() {}" > shared/src/lib.rs
+
+# Build dependencies (this layer will be cached if Cargo files don't change)
+ENV CARGO_BUILD_JOBS=2
+RUN cargo build --release -p server && \
+    rm -rf server/src client/src shared/src
+
+# Now copy actual source code
 COPY shared ./shared
 COPY server ./server
-COPY client ./client
 
-# Build server in release mode (limit parallelism to reduce memory usage)
-ENV CARGO_BUILD_JOBS=2
+# Build server (only rebuilds if source changed)
 RUN cargo build --release -p server
 
 # Stage 2: Build WASM client
@@ -33,22 +47,36 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install wasm32 target and build tools
+# Install wasm32 target and build tools (cache this layer)
 RUN rustup target add wasm32-unknown-unknown
 
-# Install Trunk and wasm-bindgen-cli separately to reduce memory pressure
-# Use --locked and limit parallelism to reduce memory usage
+# Install Trunk and wasm-bindgen-cli (cache this layer if versions don't change)
 ENV CARGO_BUILD_JOBS=1
 RUN cargo install --locked wasm-bindgen-cli && \
     cargo install --locked trunk
 
-# Copy workspace files (need all members for workspace to be valid)
+# Copy only Cargo files first for better caching
 COPY Cargo.toml Cargo.lock ./
+COPY shared/Cargo.toml ./shared/
+COPY client/Cargo.toml ./client/
+COPY server/Cargo.toml ./server/
+
+# Create dummy source files to build dependencies only
+RUN mkdir -p shared/src client/src server/src && \
+    echo "fn main() {}" > client/src/main.rs && \
+    echo "fn main() {}" > server/src/main.rs && \
+    echo "pub fn dummy() {}" > shared/src/lib.rs
+
+# Build dependencies (this layer will be cached if Cargo files don't change)
+RUN cargo build --release --target wasm32-unknown-unknown -p client && \
+    rm -rf client/src server/src shared/src
+
+# Now copy actual source code
 COPY shared ./shared
 COPY client ./client
 COPY server ./server
 
-# Build client WASM
+# Build client WASM (only rebuilds if source changed)
 WORKDIR /app/client
 RUN trunk build --release
 
