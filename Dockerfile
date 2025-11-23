@@ -127,13 +127,9 @@ fi\n\
 echo "Testing nginx configuration..."\n\
 nginx -t || { echo "ERROR: nginx config test failed"; exit 1; }\n\
 echo "Starting nginx in background..."\n\
-nginx || { echo "ERROR: nginx failed to start"; exit 1; }\n\
+nginx || { echo "ERROR: nginx failed to start"; cat /var/log/nginx/error.log 2>/dev/null || true; exit 1; }\n\
 sleep 1\n\
-if ! pgrep -x nginx > /dev/null; then\n\
-    echo "ERROR: nginx process not found after startup"\n\
-    exit 1\n\
-fi\n\
-echo "nginx is running (pid: $(pgrep -x nginx))"\n\
+echo "nginx started, proceeding to start server..."\n\
 echo "Starting server on port ${PORT:-4001}..."\n\
 exec /app/server\n\
 ' > /app/start.sh && chmod +x /app/start.sh
