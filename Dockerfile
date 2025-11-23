@@ -79,7 +79,16 @@ COPY client ./client
 COPY server ./server
 
 # Rebuild client with actual source (only rebuilds if source changed)
+# Pre-populate Trunk's wasm-bindgen cache with version 0.2.92 that supports clone_ref
+# Trunk will detect 0.2.105 in Cargo.lock, but we pre-install 0.2.92 in the expected location
 WORKDIR /app/client
+RUN mkdir -p /root/.cache/trunk/wasm-bindgen-0.2.92 && \
+    cargo install --locked wasm-bindgen-cli --version 0.2.92 && \
+    cp /usr/local/cargo/bin/wasm-bindgen /root/.cache/trunk/wasm-bindgen-0.2.92/wasm-bindgen && \
+    chmod +x /root/.cache/trunk/wasm-bindgen-0.2.92/wasm-bindgen
+# Force Trunk to use 0.2.92 by creating a symlink from 0.2.105 to 0.2.92
+RUN mkdir -p /root/.cache/trunk/wasm-bindgen-0.2.105 && \
+    ln -sf /root/.cache/trunk/wasm-bindgen-0.2.92/wasm-bindgen /root/.cache/trunk/wasm-bindgen-0.2.105/wasm-bindgen
 RUN trunk build --release
 
 # Stage 3: Runtime image
