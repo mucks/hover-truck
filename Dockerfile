@@ -115,9 +115,26 @@ COPY nginx.conf /etc/nginx/nginx.conf
 # Create startup script
 RUN echo '#!/bin/bash\n\
 set -e\n\
-# Start nginx in background\n\
-nginx\n\
-# Start server in foreground\n\
+echo "=== Starting Hover Truck ==="\n\
+echo "Checking server binary..."\n\
+if [ ! -f /app/server ]; then\n\
+    echo "ERROR: Server binary not found at /app/server"\n\
+    exit 1\n\
+fi\n\
+if [ ! -x /app/server ]; then\n\
+    chmod +x /app/server\n\
+fi\n\
+echo "Testing nginx configuration..."\n\
+nginx -t || { echo "ERROR: nginx config test failed"; exit 1; }\n\
+echo "Starting nginx in background..."\n\
+nginx || { echo "ERROR: nginx failed to start"; exit 1; }\n\
+sleep 1\n\
+if ! pgrep -x nginx > /dev/null; then\n\
+    echo "ERROR: nginx process not found after startup"\n\
+    exit 1\n\
+fi\n\
+echo "nginx is running (pid: $(pgrep -x nginx))"\n\
+echo "Starting server on port ${PORT:-4001}..."\n\
 exec /app/server\n\
 ' > /app/start.sh && chmod +x /app/start.sh
 
