@@ -22,7 +22,11 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+	// Initialize logging first
 	tracing_subscriber::fmt().with_env_filter("info").init();
+	// Log immediately to verify logging works
+	eprintln!("Server starting...");
+	info!("Server starting with tracing initialized");
 
 	let mut sim = GameSim::new(GameConfig::default());
 	// Spawn some bots at startup

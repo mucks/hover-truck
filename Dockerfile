@@ -138,10 +138,13 @@ RUN echo '#!/bin/bash\n\
     # Verify server binary one more time\n\
     echo "Server binary info:"\n\
     ls -lh /app/server || true\n\
-    file /app/server || true\n\
-    echo "About to exec server..."\n\
+    echo "About to start server (this process will become PID 1)..."\n\
+    echo "Flushing output..."\n\
+    sync\n\
     # Replace shell with server process (PID 1)\n\
-    exec /app/server\n\
+    # The server should log to stdout/stderr automatically\n\
+    # Ensure output is unbuffered and redirected properly\n\
+    exec /app/server 2>&1\n\
     ' > /app/start.sh && chmod +x /app/start.sh
 
 EXPOSE 80
