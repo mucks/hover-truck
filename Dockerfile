@@ -96,11 +96,12 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# Install nginx and wget (for healthcheck)
+# Install nginx, wget, and coreutils (for stdbuf)
 RUN apt-get update && apt-get install -y \
     nginx \
     ca-certificates \
     wget \
+    coreutils \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy server binary
@@ -114,25 +115,34 @@ COPY nginx.conf /etc/nginx/nginx.conf
 
 # Create startup script
 RUN echo '#!/bin/bash\n\
-set -e\n\
-echo "=== Starting Hover Truck ==="\n\
-echo "Checking server binary..."\n\
-if [ ! -f /app/server ]; then\n\
+    set -e\n\
+    echo "=== Starting Hover Truck ==="\n\
+    echo "Checking server binary..."\n\
+    if [ ! -f /app/server ]; then\n\
     echo "ERROR: Server binary not found at /app/server"\n\
     exit 1\n\
-fi\n\
-if [ ! -x /app/server ]; then\n\
+    fi\n\
+    if [ ! -x /app/server ]; then\n\
     chmod +x /app/server\n\
-fi\n\
-echo "Testing nginx configuration..."\n\
-nginx -t || { echo "ERROR: nginx config test failed"; exit 1; }\n\
-echo "Starting nginx in background..."\n\
-nginx || { echo "ERROR: nginx failed to start"; cat /var/log/nginx/error.log 2>/dev/null || true; exit 1; }\n\
-sleep 1\n\
-echo "nginx started, proceeding to start server..."\n\
-echo "Starting server on port ${PORT:-4001}..."\n\
-exec /app/server\n\
-' > /app/start.sh && chmod +x /app/start.sh
+    fi\n\
+    echo "Testing nginx configuration..."\n\
+    nginx -t || { echo "ERROR: nginx config test failed"; exit 1; }\n\
+    echo "Starting nginx in background..."\n\
+    nginx || { echo "ERROR: nginx failed to start"; cat /var/log/nginx/error.log 2>/dev/null || true; exit 1; }\n\
+    sleep 1\n\
+    echo "nginx started, proceeding to start server..."\n\
+    echo "Starting server on port ${PORT:-4001}..."\n\
+    # Set environment variables for better error reporting\n\
+    export RUST_BACKTRACE=full\n\
+    export RUST_LOG=info,server=debug\n\
+    # Verify server binary one more time\n\
+    echo "Server binary info:"\n\
+    ls -lh /app/server || true\n\
+    file /app/server || true\n\
+    echo "About to exec server..."\n\
+    # Replace shell with server process (PID 1)\n\
+    exec /app/server\n\
+    ' > /app/start.sh && chmod +x /app/start.sh
 
 EXPOSE 80
 
