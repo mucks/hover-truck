@@ -51,9 +51,11 @@ RUN apt-get update && apt-get install -y \
 # Install wasm32 target and build tools (cache this layer)
 RUN rustup target add wasm32-unknown-unknown
 
-# Install Trunk and wasm-bindgen-cli (cache this layer if versions don't change)
+# Install Trunk and wasm-bindgen-cli
+# Use a recent wasm-bindgen-cli that's compatible with 0.2.x crate version
+# Version 0.2.109+ should support all required intrinsics including clone_ref
 ENV CARGO_BUILD_JOBS=1
-RUN cargo install --locked wasm-bindgen-cli && \
+RUN cargo install wasm-bindgen-cli --version 0.2.92 && \
     cargo install --locked trunk
 
 # Copy only Cargo files first for better caching
