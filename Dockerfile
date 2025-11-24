@@ -1,153 +1,126 @@
-# Multi-stage build for hover-truck
-
-# Stage 1: Build server
+# Stage 1: Build the server
 FROM rust:1.90-slim AS server-builder
 
-WORKDIR /app
+WORKDIR /build
 
-# Install dependencies for building
+# Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only Cargo files first for better caching
+# Copy workspace files
 COPY Cargo.toml Cargo.lock ./
-COPY shared/Cargo.toml ./shared/
-COPY server/Cargo.toml ./server/
-COPY client/Cargo.toml ./client/
-
-# Create dummy source files to build dependencies only
-RUN mkdir -p shared/src server/src client/src && \
-    echo "fn main() {}" > server/src/main.rs && \
-    echo "fn main() {}" > client/src/main.rs && \
-    echo "pub fn dummy() {}" > shared/src/lib.rs
-
-# Build dependencies (this layer will be cached if Cargo files don't change)
-ENV CARGO_BUILD_JOBS=2
-RUN cargo build --release -p server
-
-# Now copy actual source code (overwrites dummy files)
 COPY shared ./shared
 COPY server ./server
-# Also copy client to satisfy workspace (even though we don't build it in this stage)
 COPY client ./client
 
-# Rebuild server with actual source (only rebuilds if source changed)
+# Build the server in release mode
 RUN cargo build --release -p server
 
-# Stage 2: Build WASM client
+# Stage 2: Build the client
 FROM rust:1.90-slim AS client-builder
 
-WORKDIR /app
+WORKDIR /build
 
-# Install dependencies for building
+# Install build dependencies including Trunk
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install wasm32 target and build tools (cache this layer)
-RUN rustup target add wasm32-unknown-unknown
+# Install Trunk and WASM target
+RUN cargo install trunk && \
+    rustup target add wasm32-unknown-unknown
 
-# Install Trunk and wasm-bindgen-cli
-# Use a recent wasm-bindgen-cli that's compatible with 0.2.x crate version
-# Version 0.2.109+ should support all required intrinsics including clone_ref
-ENV CARGO_BUILD_JOBS=1
-RUN cargo install wasm-bindgen-cli --version 0.2.92 && \
-    cargo install --locked trunk
-
-# Copy only Cargo files first for better caching
+# Copy workspace files
 COPY Cargo.toml Cargo.lock ./
-COPY shared/Cargo.toml ./shared/
-COPY client/Cargo.toml ./client/
-COPY server/Cargo.toml ./server/
-
-# Create dummy source files to build dependencies only
-RUN mkdir -p shared/src client/src server/src && \
-    echo "fn main() {}" > client/src/main.rs && \
-    echo "fn main() {}" > server/src/main.rs && \
-    echo "pub fn dummy() {}" > shared/src/lib.rs
-
-# Build dependencies (this layer will be cached if Cargo files don't change)
-RUN cargo build --release --target wasm32-unknown-unknown -p client
-
-# Now copy actual source code (overwrites dummy files)
 COPY shared ./shared
 COPY client ./client
 COPY server ./server
 
-# Rebuild client with actual source (only rebuilds if source changed)
-# Pre-populate Trunk's wasm-bindgen cache with version 0.2.92 that supports clone_ref
-# Trunk will detect 0.2.105 in Cargo.lock, but we pre-install 0.2.92 in the expected location
-WORKDIR /app/client
-RUN mkdir -p /root/.cache/trunk/wasm-bindgen-0.2.92 && \
-    cargo install --locked wasm-bindgen-cli --version 0.2.92 && \
-    cp /usr/local/cargo/bin/wasm-bindgen /root/.cache/trunk/wasm-bindgen-0.2.92/wasm-bindgen && \
-    chmod +x /root/.cache/trunk/wasm-bindgen-0.2.92/wasm-bindgen
-# Force Trunk to use 0.2.92 by creating a symlink from 0.2.105 to 0.2.92
-RUN mkdir -p /root/.cache/trunk/wasm-bindgen-0.2.105 && \
-    ln -sf /root/.cache/trunk/wasm-bindgen-0.2.92/wasm-bindgen /root/.cache/trunk/wasm-bindgen-0.2.105/wasm-bindgen
-RUN trunk build --release
+# Build the client with Trunk
+RUN cd client && trunk build --release
 
 # Stage 3: Runtime image
 FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# Install nginx, wget, and coreutils (for stdbuf)
+# Install runtime dependencies
 RUN apt-get update && apt-get install -y \
-    nginx \
     ca-certificates \
-    wget \
-    coreutils \
+    libssl3 \
+    nginx \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy server binary
-COPY --from=server-builder /app/target/release/server /app/server
+# Copy the built server binary
+COPY --from=server-builder /build/target/release/server /app/server
 
-# Copy client static files
-COPY --from=client-builder /app/client/dist /usr/share/nginx/html
+# Copy the built client files
+COPY --from=client-builder /build/client/dist /app/client/dist
 
-# Copy nginx configuration
-COPY nginx.conf /etc/nginx/nginx.conf
+# Create nginx configuration
+RUN rm -f /etc/nginx/sites-enabled/default && \
+    echo 'server {\n\
+    listen 8080;\n\
+    server_name _;\n\
+    \n\
+    root /app/client/dist;\n\
+    index index.html;\n\
+    \n\
+    location / {\n\
+    try_files $uri $uri/ /index.html;\n\
+    }\n\
+    \n\
+    # Proxy WebSocket connections to the server\n\
+    location /ws {\n\
+    proxy_pass http://127.0.0.1:4001;\n\
+    proxy_http_version 1.1;\n\
+    proxy_set_header Upgrade $http_upgrade;\n\
+    proxy_set_header Connection "upgrade";\n\
+    proxy_set_header Host $host;\n\
+    proxy_set_header X-Real-IP $remote_addr;\n\
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n\
+    proxy_set_header X-Forwarded-Proto $scheme;\n\
+    }\n\
+    }\n\
+    ' > /etc/nginx/sites-available/default && \
+    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
 
-# Create startup script
+# Create a startup script
 RUN echo '#!/bin/bash\n\
     set -e\n\
-    echo "=== Starting Hover Truck ==="\n\
-    echo "Checking server binary..."\n\
-    if [ ! -f /app/server ]; then\n\
-    echo "ERROR: Server binary not found at /app/server"\n\
-    exit 1\n\
-    fi\n\
-    if [ ! -x /app/server ]; then\n\
-    chmod +x /app/server\n\
-    fi\n\
-    echo "Testing nginx configuration..."\n\
-    nginx -t || { echo "ERROR: nginx config test failed"; exit 1; }\n\
-    echo "Starting nginx in background..."\n\
-    nginx || { echo "ERROR: nginx failed to start"; cat /var/log/nginx/error.log 2>/dev/null || true; exit 1; }\n\
-    sleep 1\n\
-    echo "nginx started, proceeding to start server..."\n\
-    echo "Starting server on port ${PORT:-4001}..."\n\
-    # Set environment variables for better error reporting\n\
-    export RUST_BACKTRACE=full\n\
-    export RUST_LOG=info,server=debug\n\
-    # Verify server binary one more time\n\
-    echo "Server binary info:"\n\
-    ls -lh /app/server || true\n\
-    echo "About to start server (this process will become PID 1)..."\n\
-    echo "Flushing output..."\n\
-    sync\n\
-    # Replace shell with server process (PID 1)\n\
-    # The server should log to stdout/stderr automatically\n\
-    # Ensure output is unbuffered and redirected properly\n\
-    exec /app/server 2>&1\n\
+    \n\
+    # Start the server in the background\n\
+    echo "[docker] starting server..."\n\
+    /app/server &\n\
+    SERVER_PID=$!\n\
+    \n\
+    # Cleanup function\n\
+    cleanup() {\n\
+    echo "[docker] stopping server (pid $SERVER_PID)..."\n\
+    kill $SERVER_PID 2>/dev/null || true\n\
+    nginx -s quit 2>/dev/null || true\n\
+    exit 0\n\
+    }\n\
+    trap cleanup SIGTERM SIGINT EXIT\n\
+    \n\
+    # Wait for server to start\n\
+    sleep 2\n\
+    \n\
+    # Start nginx\n\
+    echo "[docker] starting nginx on port 8080..."\n\
+    echo "[docker] Open http://localhost:8080 in your browser"\n\
+    nginx -g "daemon off;" &\n\
+    NGINX_PID=$!\n\
+    \n\
+    # Wait for either process to exit\n\
+    wait -n\n\
     ' > /app/start.sh && chmod +x /app/start.sh
 
-EXPOSE 80
+EXPOSE 8080 4001
 
 CMD ["/app/start.sh"]
 
